@@ -1,36 +1,27 @@
 import os
 from tqdm import tqdm
-import numpy as np
-import torch
+from torch import device, cuda
 import pickle
 import logging
 import pandas as pd
 import polars as pl
 import glob
-from datetime import datetime
 from enum import Enum
-
 import spacy
-
-import nltk
-import re
-import multiprocessing
-from typing import Any, Tuple, Dict, List, Union
-from nltk.sentiment import SentimentIntensityAnalyzer
-from gensim import corpora, models
+from multiprocessing import cpu_count
+from typing import Any, Tuple, Union
+from gensim import models
+from gensim.corpora import Dictionary
+from gensim.models import LdaModel
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBRegressor
 # Import local modules
 from utils.utils import setup_logging
 
 
 # Setup logging and download required NLTK lexicon.
-setup_logging(console_level=logging.ERROR)
-nltk.download('vader_lexicon')
+setup_logging()
 
 
 class ScrapedDataCategory(Enum):
@@ -39,21 +30,17 @@ class ScrapedDataCategory(Enum):
     
 class StockSymbol(Enum):
     NVDA = "NVDA"
+    
+class ColumnNames(Enum):
+    PRICE_CHANGE_PREDICTION = "price_change_prediction"
 
 
 class PreprocessNewsData:
     def __init__(self):
-        """
-        Initializes the PreprocessNewsData class, setting up resources for
-        processing news data. Loads a JSON file containing stock symbols,
-        initializes a spaCy NLP model for natural language processing tasks,
-        and sets up a sentiment intensity analyzer using NLTK's VADER lexicon.
-        """
         self.stock_symbols_json = 'data/static/exports/json/scrapers/stocks/symbols.json'
-        self.sia = SentimentIntensityAnalyzer()
-        self.num_cores = multiprocessing.cpu_count()
+        self.num_cores = cpu_count()
         
-    def merge_parquet_data(self, directory: str, data_category: str = ScrapedDataCategory.NEWS.value, export_to_parquet: bool = True) -> str:
+    def merge_parquet_data(self, directory: str, data_category: str = ScrapedDataCategory.NEWS.value, export_to_parquet: bool = True, export_dir: str = 'data/processed') -> str:
         """
         Merge parquet data from a directory of parquet files into a single LazyFrame,
         and optionally export it to a parquet file.
@@ -84,7 +71,7 @@ class PreprocessNewsData:
             if file_size > 12:
                 merged_dfs.append(pl.scan_parquet(file))
         df = pl.concat(merged_dfs, how='vertical_relaxed')
-        export_path = f"data/static/exports/parquet/merged_raw_scraped_{data_category}.parquet"
+        export_path = export_dir + f"/{data_category}.parquet"
         if export_to_parquet:
             df.sink_parquet(export_path)
         return export_path
@@ -126,6 +113,7 @@ class PreprocessNewsData:
         merged_data.dropna(subset=['article_date'], inplace=True)
         merged_data.sort_values(by='article_date', inplace=True)
         merged_data.set_index('article_date', inplace=True)
+        merged_data.index = pd.to_datetime(merged_data.index)
         if export_to_parquet and export_path:
             merged_data.to_parquet(export_path)
         return merged_data
@@ -188,7 +176,8 @@ class PreprocessNewsData:
         
         df = df.collect().to_pandas()
         df['stock_price_date'] = pd.to_datetime(df['stock_price_date'])
-        df['stock_price_change'] = df.groupby('symbol')['close_price'].pct_change()
+        # TODO: DEBUG: Percentage is not calculcated correctly for the current day, compared to previous business day
+        df['stock_price_change'] = df.groupby('symbol')['close_price'].pct_change().fillna(0)
         return df
         
     def load_news_df(self, data_path: str, n_rows: int = None) -> pd.DataFrame:
@@ -215,71 +204,9 @@ class ClassifyNewsData:
     
     def __init__(self):
         self.nlp = spacy.load("en_core_web_trf")
-        self.n_threads = multiprocessing.cpu_count()
+        self.n_threads = cpu_count()
         self.n_topics = 10
-        self.lda_model = LatentDirichletAllocation(n_components=self.n_topics, max_iter=20, learning_method='online', learning_offset=20.,random_state=42)
                   
-    def extract_topics(self, df: pd.DataFrame, lda_model: LatentDirichletAllocation, n_components: int = 10) -> pd.DataFrame:
-        # Get the topic assignments for each document
-        topic_assignments = lda_model.transform(df['processed_text'])
-
-        # Create new columns in the dataframe for each topic
-        for i in range(n_components):
-            df[f'Topic {i+1}'] = topic_assignments[:, i]
-
-        return df
-
-    def extract_sentiment(self, text: str) -> float:
-        """
-        Extract the sentiment from a given text using VADER.
-
-        Args:
-            text (str): The text to extract sentiment from.
-
-        Returns:
-            float: The sentiment score between -1 (very negative) and 1 (very positive).
-        """
-        if text is None:
-            return 0.0
-        return self.sia.polarity_scores(text)['compound']
-
-    def extract_topics_and_sentiment(self, text: str) -> Dict[str, float]:
-        """
-        Extract topics and sentiment from a given text using LDA and VADER, respectively.
-
-        Args:
-            text (str): The text to extract topics and sentiment from.
-
-        Returns:
-            Dict[str, float]: A dictionary containing the topics and sentiment, where
-                the keys are the topic names and the values are the topic weights and
-                sentiment score.
-        """
-        # TODO: Enhance this algorithm.
-        logging.info("Extracting topics and sentiment from dataframe...")
-        topics = self.extract_topics([text], num_topics=30, passes=3)
-        topic_dict = {}
-        for topic in topics:
-            topic_id, topic_str = topic
-            try:
-                parts = topic_str.split('+')
-                first_part = parts[0].strip()
-                if '*' in first_part:
-                    _, word_part = first_part.split('*', 1)
-                    top_word = word_part.strip().strip('"')
-                else:
-                    top_word = f"Topic_{topic_id}"
-                try:
-                    top_weight = float(first_part.split('*')[0].strip())
-                except Exception:
-                    top_weight = 0.0
-            except Exception:
-                top_word = f"Topic_{topic_id}"
-                top_weight = 0.0
-            topic_dict[top_word] = top_weight
-        sentiment = self.extract_sentiment(text)
-        return {"topics": topic_dict, "sentiment": sentiment}
-
     def _clean_key(self, key: str) -> str:
         """
         Clean a key by removing any special characters.
@@ -292,16 +219,16 @@ class ClassifyNewsData:
         """
         return key.replace('^', '').replace('[', '').replace(']', '').replace('<', '')
 
-    def clean_keys(self, d: dict, keys_to_extract: List[str] = None) -> Dict[str, str]:
+    def clean_keys(self, d: dict, keys_to_extract: list[str] = None) -> dict[str, str]:
         """
         Clean a dictionary of keys by removing any special characters and extracting specific keys.
 
         Args:
             d (dict): The dictionary to clean.
-            keys_to_extract (List[str], optional): The list of keys to extract and clean. Defaults to None.
+            keys_to_extract (list[str], optional): The list of keys to extract and clean. Defaults to None.
 
         Returns:
-            Dict[str, str]: A new dictionary with cleaned and extracted keys.
+            dict[str, str]: A new dictionary with cleaned and extracted keys.
         """
         new_dict = {}
         if keys_to_extract is None:
@@ -311,108 +238,8 @@ class ClassifyNewsData:
                 ck = self._clean_key(k)
                 new_dict[ck] = d[k]
         return new_dict
-
-    def lda_predict(self, text: str, lda_model: LatentDirichletAllocation, rf_model: RandomForestClassifier, vectorizer: CountVectorizer) -> Tuple[int, float]:
-        # Preprocess the text
-        """
-        Predicts the class and sentiment score for a given text using a fitted LDA model and Random Forest classifier.
-        To be used to classify new news content and get its sentiment score.
-
-        Args:
-            text (str): The text to predict the class and sentiment score for.
-            lda_model (LatentDirichletAllocation): The fitted LDA model.
-            rf_model (RandomForestClassifier): The trained Random Forest classifier.
-            vectorizer (CountVectorizer): The vectorizer used to transform the text data.
-
-        Returns:
-            Tuple[int, float]: A tuple containing the predicted class and sentiment score.
-        """
-        processed_text = self.preprocess_text(text)
-
-        # Convert the list of tokens to a space-separated string
-        processed_text = ' '.join(processed_text)
-
-        # Vectorize the text
-        X = vectorizer.transform([processed_text])
-
-        # Transform the text using the fitted LDA model
-        X_topics = lda_model.transform(X)
-
-        # Predict the class
-        predicted_class = rf_model.predict(X_topics)[0]
-
-        # Calculate sentiment score
-        sentiment_score = self.sia.polarity_scores(text)['compound']
-
-        return predicted_class, sentiment_score
-       
-    def lda_news_topic_modeling(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, LatentDirichletAllocation, CountVectorizer, np.ndarray]:
-        """
-        Fits a Latent Dirichlet Allocation (LDA) model to the given text data.
-
-        This method preprocesses the text data, converts it to a vectorized form, and fits an LDA model to extract topics.
-
-        Args:
-            df (pd.DataFrame): DataFrame containing the news content.
-
-        Returns:
-            Tuple[LatentDirichletAllocation, CountVectorizer, np.ndarray]: The fitted LDA model, 
-            the vectorizer, and the topic distribution for each document.
-        """
-        logging.info("Preprocessing data before LDA fit...")
-        random_state = 42
-        # Preprocess the text data
-        with multiprocessing.Pool(processes=32) as pool:
-            results = pool.map(self.preprocess_text, df['content'])
-        df['processed_text'] = results
-
-        # Vectorize the text data
-        logging.info("Vectorizing text data before LDA fit...")
-        vectorizer = CountVectorizer(stop_words='english')
-        X = vectorizer.fit_transform(df['processed_text'])
-
-        # Fit LDA model
-        logging.info("Fitting LDA model...")
-        lda_model = LatentDirichletAllocation(n_components=20, random_state=random_state)
-        X_topics = lda_model.fit_transform(X)
-
-        return df, lda_model, vectorizer, X_topics
-
-    def lda_get_class_sentiment(self, df: pd.DataFrame, target_column: str, lda_model: LatentDirichletAllocation, vectorizer: CountVectorizer, X_topics: np.ndarray) -> pd.DataFrame:
-        """
-        Predicts the class and sentiment for each text in the given DataFrame using the trained LDA model.
-
-        Args:
-            df (pd.DataFrame): DataFrame containing the news content and price change data.
-            target_column (str): Name of the column containing the price change data.
-
-        Returns:
-            pd.DataFrame: A DataFrame containing the predicted class and sentiment scores for each text.
-        """
-        logging.info("Predicting class and sentiment...")
-
-        # Create a dataframe with the predicted classes as columns
-        class_df = pd.DataFrame(X_topics, columns=[f'Class_{i}' for i in range(X_topics.shape[1])])
-
-        # Add the class_df to the original dataframe
-        df = pd.concat([df, class_df], axis=1)
-
-        # Calculate the sentiment score for each class
-        sentiment_scores = df.apply(lambda row: self.calculate_sentiment(row, target_column), axis=1)
-
-        # Add the sentiment scores to the dataframe
-        df['sentiment_score'] = sentiment_scores
-
-        return df
-
-    def calculate_sentiment(self, row, target_column):
-        # Calculate the sentiment score based on the correlation between the predicted classes and the target column
-        sentiment_score = 0
-        for i in range(len(row) - 1):  # exclude the last column (sentiment_score)
-            sentiment_score += row[i] * (row[f'Class_{i}'] / sum(row[[f'Class_{j}' for j in range(len(row) - 1)]])) * row[target_column]
-        return sentiment_score
-   
-    def preprocess_df(self, df: pd.DataFrame, export_to_parquet: bool = True) -> Tuple[pd.DataFrame, str, LatentDirichletAllocation, RandomForestClassifier, CountVectorizer]:
+         
+    def preprocess_df(self, df: pd.DataFrame, export_to_parquet: bool = True, export_dir: str = 'data/processed') -> pd.DataFrame:
         """
         Preprocesses a DataFrame by extracting stock prices, cleaning keys, and running LDA with a Random Forest classifier
         to predict class and sentiment.
@@ -426,7 +253,8 @@ class ClassifyNewsData:
             pd.DataFrame: The preprocessed DataFrame with predicted class and sentiment.
         """
         logging.info("Preprocessing text with spacy...")
-        docs = self.nlp.pipe(texts=df['content'], batch_size=100, disable=["ner", "parser"])
+        # TODO: May need to enable 'tagger'+'attribute_ruler' or 'morphologizer'.
+        docs = self.nlp.pipe(texts=df['content'], batch_size=100, disable=["ner", "parser", "tagger", "entity_linker", "entity_ruler", "textcat", "textcat_multilabel", "morphologizer", "attribute_ruler", "senter", "sentencizer", "transformer"])
         sequences = (
             [token.lemma_ for token in doc if not token.is_stop and not token.is_punct and token.lemma_ and not token.lemma_.isspace()]
             for doc in docs
@@ -435,10 +263,29 @@ class ClassifyNewsData:
             tqdm(sequences, total=len(df), desc="Processing text")
         )
         
-        logging.info("Topic modeling using LDA...")
-        self.lda_model.fit(df['processed_text'])
-        df = self.extract_topics(df=df, lda_model=self.lda_model, n_components=self.n_topics)
+        # NOTE: See more: https://medium.com/@sayahfares19/text-analysis-topic-modelling-with-spacy-gensim-4cd92ef06e06
+        logging.info("Creating bigrams...")
+        # Treating certain word pairs as single tokens can improve the interpretability of our topics.
+        # For example, “New York” is more meaningful as a single entity than “New” and “York” separately.
+        # We can use Gensim’s Phrases model to detect common bigrams
+        bigram = models.phrases.Phrases(df['processed_text'])
+        df['processed_text'] = [bigram[line] for line in df['processed_text']]
         
+        # TODO: Try different n_topics, models instead of LDA etc.
+        logging.info("Topic modeling using LDA...")
+        # Gensim requires two main components for topic modeling:
+        # A Dictionary: mapping between words and their integer ids
+        # A Corpus: a list of documents, where each document is represented as a bag-of-words
+        dictionary = Dictionary(df['processed_text'])
+        corpus = [dictionary.doc2bow(text) for text in df['processed_text']]
+        lda_model = LdaModel(corpus=corpus, num_topics=self.n_topics, id2word=dictionary)
+        topics = lda_model.show_topics(formatted=False)
+        topics_df = pd.DataFrame([(topic, word, weight) for topic, words in topics for word, weight in words], 
+                                 columns=['topic', 'word', 'weight'])
+        topics_df['word'] = topics_df['word'].astype(str).str.replace('\"', '').str.strip()
+        topics_df['weight'] = topics_df['weight'].astype(float)
+        df['news_weight_on_stock_price_change'] = df['processed_text'].apply(lambda x: topics_df[topics_df['word'].isin(x)]['weight'].sum() if x else 0)
+
         logging.info("Extracting stock prices...")
         stock_df = df['stock_prices'].apply(lambda x: pd.Series(self.clean_keys(x, [StockSymbol.NVDA.value])))
         stock_df = stock_df.map(lambda x: float(x.strip('(),.% ').replace('+', '').replace(',', '').replace('(', '-').replace(')', '').replace('%', '')) if isinstance(x, str) else x)
@@ -448,60 +295,21 @@ class ClassifyNewsData:
         combined_df = stock_df.combine_first(df[['id_news']])
         combined_df = combined_df.set_index('id_news')
         df = pd.merge(df, combined_df, left_on='id_news', right_index=True, how='left')
-        
-        df, lda_model, vectorizer, X_topics = self.lda_news_topic_modeling(df)
-        with open('data/static/exports/pickle/stock_prices/lda_model.pkl', 'wb') as f:
-            pickle.dump(lda_model, f)
-        with open('data/static/exports/pickle/stock_prices/lda_x_topics.pkl', 'wb') as f:
-            pickle.dump(X_topics, f)
-        with open('data/static/exports/pickle/stock_prices/lda_vectorizer.pkl', 'wb') as f:
-            pickle.dump(vectorizer, f)
-        # else:
-        #     df['topics_sentiments'] = df['content'].apply(self.extract_topics_and_sentiment)
-        #     df['sentiment'] = df['topics_sentiments'].apply(lambda x: x.get('sentiment', 0))
-        #     topics_df = df['topics_sentiments'].apply(lambda x: pd.Series(self.clean_keys(x.get('topics', {}))))
-        #     combined_df = stock_df.combine_first(topics_df)
+
         cols_to_drop = ['stock_prices', 'id_news', 'id_stock_prices', 'url_stock_prices', 'url_news', 'title', 'content', 'timestamp_news', 'timestamp_stock_prices', 'sentiment']
         df.drop(columns=[col for col in cols_to_drop if col in df.columns], inplace=True)
         
         if export_to_parquet:
-            df.to_parquet(path="data/static/exports/parquet/ml_stock_prices/processed_news_data.parquet", index=True)
+            df.to_parquet(path=''.join([export_dir, '/processed_news_data.parquet']), index=True)
         logging.info("Dataframe preprocessed.")
-        return df, lda_model, vectorizer, X_topics
+        return df
 
 
 class StockPricePredictor:
     def __init__(self, predictor_path: str):
-        
-        """
-        Initialize the StockPricePredictor object.
-
-        Parameters
-        ----------
-        predictor_path : str
-            Path to the saved model.
-
-        Attributes
-        ----------
-        forecast_horizon : int
-            Predict n days ahead.
-        window_length : int
-            Use last n observations for forecasting.
-        use_gpu : bool
-            Use GPU if available.
-        device : torch.device
-            Device to use for computations.
-        predictor_model_path : str
-            Path to the saved model.
-        frequency : str
-            Frequency of the target time series set to B (business day).
-        """
-        self.forecast_horizon = 3   # Predict n days ahead.
-        self.window_length = 5  # Use last n observations for forecasting.
         self.use_gpu = False
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if self.use_gpu else torch.device('cpu') # Use GPU if available.
+        self.device = device('cuda' if cuda.is_available() else 'cpu') if self.use_gpu else device('cpu') # Use GPU if available.
         self.predictor_model_path = predictor_path  # Path to the saved model.
-        self.frequency = 'B'    # Frequency of the target time series set to B (business day).
 
     def create_features(self, df: pd.DataFrame, label: str = None) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.Series]]:
         """
@@ -618,7 +426,7 @@ class StockPricePredictor:
         logging.info(f"Model saved to {self.predictor_model_path}")
         return forecaster
 
-    def evaluate_model(self, test_data: pd.DataFrame, target_column: str, prediction_column: str = 'Prediction') -> None:
+    def evaluate_model(self, test_data: pd.DataFrame, target_column: str) -> None:
         """
         Evaluate the performance of the model on the test set.
 
@@ -640,16 +448,16 @@ class StockPricePredictor:
         The metrics used are Mean Squared Error (MSE), R-Squared (R2), Mean Absolute Error (MAE) and Mean Absolute Percentage Error (MAPE).
         """
         logging.info("Evaluating model...")
-        mse = mean_squared_error(test_data[target_column], test_data[prediction_column])
-        r2 = r2_score(test_data[target_column], test_data[prediction_column])
-        mae = mean_absolute_error(test_data[target_column], test_data[prediction_column])
-        mape = mean_absolute_percentage_error(test_data[target_column], test_data[prediction_column])
+        mse = mean_squared_error(test_data[target_column], test_data[ColumnNames.PRICE_CHANGE_PREDICTION.value])
+        r2 = r2_score(test_data[target_column], test_data[ColumnNames.PRICE_CHANGE_PREDICTION.value])
+        mae = mean_absolute_error(test_data[target_column], test_data[ColumnNames.PRICE_CHANGE_PREDICTION.value])
+        mape = mean_absolute_percentage_error(test_data[target_column], test_data[ColumnNames.PRICE_CHANGE_PREDICTION.value])
         logging.info(f'Test MSE: {mse:.2f}')
         logging.info(f'Test R2: {r2:.2f}')
         logging.info(f'Test MAE: {mae:.2f}')
         logging.info(f'Test MAPE: {mape:.2f}')
 
-    def predict_price(self, model: Any, df: pd.DataFrame, target_column: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def predict_price_change(self, model: Any, df: pd.DataFrame, target_column: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Makes predictions on the test set using the given model and DataFrame.
         Then, combines the test and train data into a single DataFrame, and returns it.
@@ -677,7 +485,7 @@ class StockPricePredictor:
         train_data, test_data = self.split_data(df=df)
         X_train, y_train = self.create_features(train_data, label=target_column)
         X_test, y_test = self.create_features(test_data, label=target_column)
-        test_data['Prediction'] = model.predict(X_test)
+        test_data[ColumnNames.PRICE_CHANGE_PREDICTION.value] = model.predict(X_test)
         df_all = pd.concat([test_data, train_data], sort=False)
         return df_all, train_data, test_data
 
@@ -721,12 +529,13 @@ class StockPricePredictor:
 
 
 def run_stock_price_predictive_pipeline():
-    raw_scraped_news_parquet_dir_path = "data/static/exports/parquet/ml_stock_prices/scraped_data/news/*.parquet"
-    raw_scraped_stock_prices_parquet_dir_path = "data/static/exports/parquet/ml_stock_prices/scraped_data/prices/*.parquet"
-    predictor_model_path = 'data/static/exports/pickle/stock_prices/stock_price_predictor_forecaster.pkl'
-    merged_data_path = 'data/merged_raw_scraped_news_with_stock_prices.parquet'
-    processed_merged_data_path = "data/static/exports/parquet/ml_stock_prices/processed_news_data.parquet"
-    use_processed_data = False
+    raw_scraped_news_parquet_dir_path = "data/scraped/news/*.parquet"
+    raw_scraped_stock_prices_parquet_dir_path = "data/scraped/prices/*.parquet"
+    predictor_model_path = 'models/stock_price_predictor_forecaster.pkl'
+    merged_data_path = 'data/processed/merged_raw_scraped_news_with_stock_prices.parquet'
+    processed_merged_data_path = "data/processed/processed_news_data.parquet"
+    use_processed_data = True
+    use_pretrained_model = True
     merge_and_process_raw_scraped_data = False
     target_column = StockSymbol.NVDA.value  # Change this to your target stock symbol.
     
@@ -746,37 +555,28 @@ def run_stock_price_predictive_pipeline():
         merged_data = pnd.merge_scraped_news_with_prices_data(news_df=preprocess_scraped_news_data_df, stock_prices_df=preprocess_scraped_stock_prices_data_df, export_path=merged_data_path)
     else:
         merged_data = pnd.load_news_df(data_path=merged_data_path)
+        merged_data.index = pd.to_datetime(merged_data.index)
         
     if not use_processed_data:
-        merged_data, lda_model, vectorizer, X_topics = cnd.preprocess_df(df=merged_data)
+        merged_data = cnd.preprocess_df(df=merged_data)
         
-        # TODO: Do not split, but use actual daily data
         all_news_df, daily_news_df = spp.split_data(df=merged_data)
     else:
-        with open('data/static/exports/pickle/stock_prices/lda_model.pkl', 'rb') as f:
-            lda_model = pickle.load(f)
-        with open('data/static/exports/pickle/stock_prices/lda_x_topics.pkl', 'rb') as f:
-            X_topics = pickle.load(f)
-        with open('data/static/exports/pickle/stock_prices/lda_vectorizer.pkl', 'rb') as f:
-            vectorizer = pickle.load(f)
         all_news_df = pd.read_parquet(processed_merged_data_path)
         
-        # TODO: Do not split, but use actual daily data
         all_news_df, daily_news_df = spp.split_data(df=all_news_df)
-        
-    daily_news_with_sentiment_df = pnd.lda_get_class_sentiment(df=all_news_df, target_column='stock_price_change', lda_model=lda_model, vectorizer=vectorizer, X_topics=X_topics)
-    
+            
     if target_column not in all_news_df.columns:
         raise ValueError(f"Target column {target_column} not found in dataframe columns.")
     
     # ------- Machine Learning Pipeline -------
-    if not use_processed_data:
+    if not use_pretrained_model:
         forecaster = spp.train_model(df=all_news_df, target_column=target_column)
     else:
         with open(predictor_model_path, 'rb') as f:
             forecaster = pickle.load(f)
     
-    df_with_predictions, train_data, test_data = spp.predict_price(model=forecaster, df=daily_news_df, target_column=target_column)
+    df_with_predictions, train_data, test_data = spp.predict_price_change(model=forecaster, df=daily_news_df, target_column=target_column)
     spp.evaluate_model(test_data=test_data, target_column=target_column)
 
     latest_date = df_with_predictions.index.max()
@@ -785,5 +585,4 @@ def run_stock_price_predictive_pipeline():
             
             
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     run_stock_price_predictive_pipeline()

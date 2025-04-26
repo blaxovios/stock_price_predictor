@@ -32,6 +32,3 @@ def setup_logging(debug_filename: str = 'debug', console_level: int = logging.IN
         logging.root.addHandler(console_handler)
 
     logging.info("Local logging setup complete")
-    
-    # Print current handlers after setup
-    print("Handlers after setup:", logging.root.handlers)
