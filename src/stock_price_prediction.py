@@ -5,6 +5,7 @@ import pickle
 import logging
 import pandas as pd
 import polars as pl
+import numpy as np
 import glob
 from enum import Enum
 import spacy
@@ -33,6 +34,7 @@ class StockSymbol(Enum):
     
 class ColumnNames(Enum):
     PRICE_CHANGE_PREDICTION = "price_change_prediction"
+    CLOSE_PRICE_PCT_CHANGE = "close_price_pct_change"
 
 
 class PreprocessNewsData:
@@ -114,6 +116,8 @@ class PreprocessNewsData:
         merged_data.sort_values(by='article_date', inplace=True)
         merged_data.set_index('article_date', inplace=True)
         merged_data.index = pd.to_datetime(merged_data.index)
+        # Because stock prices dataset is updated daily per business day, while news data is updated daily by calendar. Use ffill to fill missing stock prices with previous day value.
+        merged_data.ffill(inplace=True)
         if export_to_parquet and export_path:
             merged_data.to_parquet(export_path)
         return merged_data
@@ -144,12 +148,16 @@ class PreprocessNewsData:
             pl.col("article_date").cast(pl.Datetime, strict=False).is_not_null()
         )
         # Convert stock_prices field: strip (%) and cast to float.
-        df = df.filter(
-            pl.col("stock_prices").map_elements(
-                lambda s: {k: float(v.strip('(),.%').replace('+', '').replace(',', '').replace('(', '-').replace(')', '').replace('%', '')) if v else None for k, v in s.items()},
-                return_dtype=pl.Struct
-            ).is_not_null()
-        )
+        # df = df.filter(
+        #     pl.col("stock_prices").map_elements(
+        #         lambda s: {k: float(v.strip('(),.%').replace('+', '').replace(',', '').replace('(', '-').replace(')', '').replace('%', '')) if v else None for k, v in s.items()},
+        #         return_dtype=pl.Struct
+        #     ).is_not_null()
+        # )
+        
+        # Drop column stock_prices from lazyframe
+        df = df.drop("stock_prices")
+        
         # Convert 'article_date' from datetime to date (yyyy-mm-dd) while keeping the latest
         df = df.with_columns(
             pl.col("article_date").str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S%.fZ", strict=False)
@@ -176,8 +184,11 @@ class PreprocessNewsData:
         
         df = df.collect().to_pandas()
         df['stock_price_date'] = pd.to_datetime(df['stock_price_date'])
-        # TODO: DEBUG: Percentage is not calculcated correctly for the current day, compared to previous business day
-        df['stock_price_change'] = df.groupby('symbol')['close_price'].pct_change().fillna(0)
+        # Calculate the percentage change for the stock price for current day, compared to previous business day
+        df = df.sort_values(by=['stock_price_date', 'symbol'])
+        df['prev_close_price'] = df['close_price'].shift().where(df['symbol'] == df['symbol'].shift(), np.nan)
+        df[ColumnNames.CLOSE_PRICE_PCT_CHANGE.value] = (df['close_price'] - df['prev_close_price']) / df['prev_close_price']
+        df = df.drop(columns=['prev_close_price'])
         return df
         
     def load_news_df(self, data_path: str, n_rows: int = None) -> pd.DataFrame:
@@ -279,26 +290,25 @@ class ClassifyNewsData:
         dictionary = Dictionary(df['processed_text'])
         corpus = [dictionary.doc2bow(text) for text in df['processed_text']]
         lda_model = LdaModel(corpus=corpus, num_topics=self.n_topics, id2word=dictionary)
-        topics = lda_model.show_topics(formatted=False)
-        topics_df = pd.DataFrame([(topic, word, weight) for topic, words in topics for word, weight in words], 
-                                 columns=['topic', 'word', 'weight'])
-        topics_df['word'] = topics_df['word'].astype(str).str.replace('\"', '').str.strip()
-        topics_df['weight'] = topics_df['weight'].astype(float)
-        df['news_weight_on_stock_price_change'] = df['processed_text'].apply(lambda x: topics_df[topics_df['word'].isin(x)]['weight'].sum() if x else 0)
+        df['doc_topics'] = [lda_model.get_document_topics(bow) for bow in corpus]
+        df['doc_weight'] = df['doc_topics'].apply(lambda td: sum(weight for _, weight in td))
+        daily = (df.groupby(df.index.date)['doc_weight'].sum().rename('daily_weight'))
 
-        logging.info("Extracting stock prices...")
-        stock_df = df['stock_prices'].apply(lambda x: pd.Series(self.clean_keys(x, [StockSymbol.NVDA.value])))
-        stock_df = stock_df.map(lambda x: float(x.strip('(),.% ').replace('+', '').replace(',', '').replace('(', '-').replace(')', '').replace('%', '')) if isinstance(x, str) else x)
-        # TODO: Not in the future. If I have daily stock prices. If not I can assume I will use previous day's or use a statistical method.
-        stock_df = stock_df.fillna(0).infer_objects(copy=False)
+        # min–max normalization into [0,1]
+        min_w, max_w = daily.min(), daily.max()
+        if max_w > min_w:
+            daily = (daily - min_w) / (max_w - min_w)
+        else:
+            daily[:] = 0.0
+        # merge back onto your original df (every row for a given date
+        # gets the same normalized daily score)
+        df = df.join(daily, on=df.index.date)
+        df.rename(columns={'daily_weight': 'news_weight_on_stock_price_change'}, inplace=True)
 
-        combined_df = stock_df.combine_first(df[['id_news']])
-        combined_df = combined_df.set_index('id_news')
-        df = pd.merge(df, combined_df, left_on='id_news', right_index=True, how='left')
-
-        cols_to_drop = ['stock_prices', 'id_news', 'id_stock_prices', 'url_stock_prices', 'url_news', 'title', 'content', 'timestamp_news', 'timestamp_stock_prices', 'sentiment']
+        cols_to_drop = ['key_0', 'doc_topics', 'doc_weight', 'id_news', 'id_stock_prices', 'url_stock_prices', 'url_news', 'title', 'content', 'timestamp_news', 'timestamp_stock_prices', 'sentiment']
         df.drop(columns=[col for col in cols_to_drop if col in df.columns], inplace=True)
         
+        df = df.loc[~df.index.normalize().duplicated(keep='first')].copy()
         if export_to_parquet:
             df.to_parquet(path=''.join([export_dir, '/processed_news_data.parquet']), index=True)
         logging.info("Dataframe preprocessed.")
@@ -537,7 +547,7 @@ def run_stock_price_predictive_pipeline():
     use_processed_data = True
     use_pretrained_model = True
     merge_and_process_raw_scraped_data = False
-    target_column = StockSymbol.NVDA.value  # Change this to your target stock symbol.
+    target_column = ColumnNames.CLOSE_PRICE_PCT_CHANGE.value
     
     pnd = PreprocessNewsData()
     cnd = ClassifyNewsData()
@@ -580,8 +590,10 @@ def run_stock_price_predictive_pipeline():
     spp.evaluate_model(test_data=test_data, target_column=target_column)
 
     latest_date = df_with_predictions.index.max()
-    latest_prediction = df_with_predictions.loc[latest_date][target_column].tail(1)
-    logging.info(f"Latest prediction: \n {latest_prediction} for {target_column} with date {latest_date}")
+    latest_prediction = df_with_predictions.loc[latest_date][ColumnNames.PRICE_CHANGE_PREDICTION.value]
+    latest_prediction_pct = latest_prediction * 100
+    change_type = "positive" if latest_prediction_pct > 0 else "negative"
+    logging.info(f"Latest prediction: {latest_prediction_pct:.2f}% with date {latest_date} ({change_type} change)")
             
             
 if __name__ == "__main__":
